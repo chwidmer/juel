@@ -22,11 +22,19 @@ import java.beans.PropertyDescriptor;
 import java.lang.reflect.Array;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+
+import javax.el.BeanELResolver.MethodDispatcher.Predicates.JuelCoercePredicat;
 
 /**
  * Defines property resolution behavior on objects using the JavaBeans component architecture. This
@@ -482,9 +490,19 @@ public class BeanELResolver extends ELResolver {
 				params = new Object[0];
 			}
 			String name = method.toString();
-			Method target = findMethod(base, name, paramTypes, params.length);
+			ExpressionFactory factory = getExpressionFactory(context);
+			Method target = findMethod(base, name, paramTypes, params, factory);
 			if (target == null) {
-				throw new MethodNotFoundException("Cannot find method " + name + " with " + params.length + " parameters in " + base.getClass());
+				Class<?>[] types = new Class<?>[params.length];
+				for (int i=0; i<params.length; i++) { 
+					types[i] = (params[i]!=null ? params[i].getClass():null);
+				} 
+                throw new MethodNotFoundException(
+                        String.format(
+                                "Cannot find method '%s' on bean with type='%s' with parmeter types='%s'",
+                                name, base.getClass(), Arrays.asList(types)
+                        )
+                );
 			}
 			try {
 				result = target.invoke(base, coerceParams(getExpressionFactory(context), target, params));
@@ -498,7 +516,7 @@ public class BeanELResolver extends ELResolver {
 		return result;
 	};
 
-	private Method findMethod(Object base, String name, Class<?>[] types, int paramCount) {
+	private Method findMethod(Object base, String name, Class<?>[] types, Object[] params, ExpressionFactory factory) {
 		if (types != null) {
 			try {
 				return findAccessibleMethod(base.getClass().getMethod(name, types));
@@ -506,18 +524,14 @@ public class BeanELResolver extends ELResolver {
 				return null;
 			}
 		}
-		Method varArgsMethod = null;
-		for (Method method : base.getClass().getMethods()) {
-			if (method.getName().equals(name)) {
-				int formalParamCount = method.getParameterTypes().length;
-				if (method.isVarArgs() && paramCount >= formalParamCount - 1) {
-					varArgsMethod = method;
-				} else if (paramCount == formalParamCount) {
-					return findAccessibleMethod(method);
-				}
-			}
+		try {
+			return findAccessibleMethod(
+				MethodDispatcher.getPublicMethod(base, name, params, factory)
+			);
 		}
-		return varArgsMethod == null ? null : findAccessibleMethod(varArgsMethod);
+		catch (Exception e ) {
+			return null;
+		}
 	}
 
 	/**
@@ -543,55 +557,67 @@ public class BeanELResolver extends ELResolver {
 	private Object[] coerceParams(ExpressionFactory factory, Method method, Object[] params) {
 		Class<?>[] types = method.getParameterTypes();
 		Object[] args = new Object[types.length];
-		if (method.isVarArgs()) {
-			int varargIndex = types.length - 1;
-			if (params.length < varargIndex) {
-				throw new ELException("Bad argument count");
-			}
-			for (int i = 0; i < varargIndex; i++) {
-				coerceValue(args, i, factory, params[i], types[i]);
-			}
-			Class<?> varargType = types[varargIndex].getComponentType();
-			int length = params.length - varargIndex;
-			Object array = null;
-			if (length == 1) {
-				Object source = params[varargIndex];
-				if (source != null && source.getClass().isArray()) {
-					if (types[varargIndex].isInstance(source)) { // use source array as is
-						array = source;
-					} else { // coerce array elements
-						length = Array.getLength(source);
-						array = Array.newInstance(varargType, length);
-						for (int i = 0; i < length; i++) {
-							coerceValue(array, i, factory, Array.get(source, i), varargType);
-						}
-					}
-				} else { // single element array
-					array = Array.newInstance(varargType, 1);
-					coerceValue(array, 0, factory, source, varargType);
-				}
-			} else {
-				array = Array.newInstance(varargType, length);
-				for (int i = 0; i < length; i++) {
-					coerceValue(array, i, factory, params[varargIndex + i], varargType);
-				}
-			}
-			args[varargIndex] = array;
-		} else {
-			if (params.length != args.length) {
-				throw new ELException("Bad argument count");
-			}
+		
+		// fixed arity methods
+		if (!method.isVarArgs()) {
 			for (int i = 0; i < args.length; i++) {
-				coerceValue(args, i, factory, params[i], types[i]);
+				Array.set(args, i, coerceValue(factory, params[i], types[i]));
 			}
 		}
+		// varArgs methods
+		else {	
+			int varArgIdx = types.length - 1;
+			
+			// handle all but the varArg parameters
+			for (int i = 0; i < varArgIdx; i++) {
+				Array.set(args, i, coerceValue(factory, params[i], types[i]));
+			}
+
+			Class<?> varargType = types[varArgIdx].getComponentType();
+			// if the param does not specify vararg
+			if (varArgIdx == params.length) {
+				args[varArgIdx] = Array.newInstance(varargType, 0);
+			}
+			// handle the varArg parameter
+			else if (params[varArgIdx] != null && !params[varArgIdx].getClass().isArray()) {
+				int length = params.length - varArgIdx;
+				args[varArgIdx] = Array.newInstance(varargType, length);
+				for (int i = 0; i < length; i++) {
+					Array.set(args[varArgIdx], i, 
+						coerceValue(factory, params[varArgIdx + i], varargType)
+					);
+				}
+			}
+			// we got the varArgs parameter as an array
+			else { 
+				Array.set(args, varArgIdx, 
+					coerceValue(factory, params[varArgIdx], types[varArgIdx])
+				);
+			} 
+		} 
 		return args;
 	}
-
-	private void coerceValue(Object array, int index, ExpressionFactory factory, Object value, Class<?> type) {
-		if (value != null || type.isPrimitive()) {
-			Array.set(array, index, factory.coerceToType(value, type));
+	
+	private Object coerceValue(ExpressionFactory factory, Object value, Class<?> type) {
+		if (type.isPrimitive() || (!type.isArray() && value != null)) {
+			value = factory.coerceToType(value, type);
 		}
+		else if (value != null && value.getClass().isArray() ) {
+			int len = Array.getLength(value);
+			Class<?> arrayType = type.getComponentType();
+			
+			Object oValue = value;
+			if (!type.isInstance(value)) { // use source array as is
+				value = Array.newInstance(arrayType, len);
+			}
+			for ( int i=0; i < len; i++ ) {
+				Array.set(value, i, 
+					coerceValue(factory, Array.get(oValue, i), arrayType)
+				);
+			}
+			
+		}
+		return value;
 	}
 	
 	/**
@@ -653,4 +679,637 @@ public class BeanELResolver extends ELResolver {
 			}
 		}
 	}
+	
+	/**
+	 * Dynamically dispatches methods calls.
+	 * 
+	 * Support dispatching of overloaded methods and vararg methods. Once a method
+	 * has been resolved the result will be cashed to speed up further method invocations
+	 * to the same method.
+	 */
+	static class MethodDispatcher {
+		static final private Map<Class<?>, Class<?>> autoBoxingMap = new HashMap<Class<?>, Class<?>>();
+		static {
+			autoBoxingMap.put(Short.TYPE, Short.class);
+			autoBoxingMap.put(Integer.TYPE, Integer.class);
+			autoBoxingMap.put(Long.TYPE, Long.class);
+			autoBoxingMap.put(Float.TYPE, Float.class);
+			autoBoxingMap.put(Double.TYPE, Double.class);
+			autoBoxingMap.put(Character.TYPE, Character.class);
+			autoBoxingMap.put(Byte.TYPE, Byte.class);
+			autoBoxingMap.put(Boolean.TYPE, Boolean.class);
+		}
+		static final private Map<Class<?>, Class<?>> autoUnboxingMap = new HashMap<Class<?>, Class<?>>();
+		static {
+			autoUnboxingMap.put(Short.class, Short.TYPE);
+			autoUnboxingMap.put(Integer.class, Integer.TYPE);
+			autoUnboxingMap.put(Long.class, Long.TYPE);
+			autoUnboxingMap.put(Float.class, Float.TYPE);
+			autoUnboxingMap.put(Double.class, Double.TYPE);
+			autoUnboxingMap.put(Character.class, Character.TYPE);
+			autoUnboxingMap.put(Byte.class, Byte.TYPE);
+			autoUnboxingMap.put(Boolean.class, Boolean.TYPE);
+		}
+
+		private static final ConcurrentHashMap<List<Object>,Method> methodCache = 
+				new ConcurrentHashMap<List<Object>, Method>();
+		
+		/**
+		 * Predicate decides whether parameter can be converted into a given type.
+		 */
+		static interface Predicate<P> {
+			/**
+			 * Checks whether the given parameter be converted into the specified class.
+			 * 
+			 * @param clazz Class into which the given parameter should be converted to
+			 * @param param Parameter which has to be converted
+			 * @return true if conversion is possible false otherwise
+			 */
+			public boolean match(Class<?> clazz, P param);
+		}
+
+		/**
+		 * A MethodFilter verifies whether a list of parameters are compatible with
+		 * the formal parameters of a given method. Depending on whether it is a
+		 * fixed varity method or a variable varity method the way comparison is 
+		 * done varies.
+		 */
+		static interface MethodFilter {
+			/**
+			 * Checks whether a method can be invoked with the given paerameters.
+			 * 
+			 * @param m Method to be tested with the given parameters
+			 * @param param Parameters to be checked against the given method
+			 * @param predicat The predicate used to check individual parameter
+			 * @return true if the method can be invoked with the given parameters false otherwise
+			 */
+			<P> boolean match(Method m, P[] param, Predicate<P> predicat);
+		}
+		
+		/**
+		 * Create a key used for the method cache.
+		 * 
+		 * Note: we use a list 
+		 * @param oType class one witch the method is defined
+		 * @param name Name of the method
+		 * @param pTypes Parameter types used to resolve the method
+		 * @param factory
+		 * @return immutable list used as key for the method cache
+		 */
+		private static List<Object> createCacheKey(
+			Class<?> oType, String name, Class<?>[] pTypes, ExpressionFactory factory
+		) {
+			ArrayList<Object> result = new ArrayList<Object>();
+			result.add(oType);
+			result.add(name);
+			for (Class<?> c : pTypes) {
+				result.add(c);
+			}
+			result.add(factory.getClass());
+			return Collections.unmodifiableList(result); // collection keys should be immutable
+		}
+		
+		/**
+		 * Resolve the public method matching the method name and given parameters.
+		 * 
+		 * @param obj The object on which the method gets invoked
+		 * @param name The name of the method
+		 * @param params The actual parameters passed to the method invocation
+		 * @param factory 
+		 * @return Method object if a method could be found on the given object matching the 
+		 * parameters <code>null</code> otherwise.
+		 */
+		public static Method getPublicMethod(
+				Object obj, String name, Object[] params,
+				ExpressionFactory factory
+		) {
+			Class<?> oType = obj.getClass();
+			Class<?>[] pTypes = deriveTypes(params);
+			
+			// lookup method in cache
+			List<Object> key = createCacheKey(oType, name, pTypes, factory);
+			Method method = methodCache.get(key);
+			if ( method != null ) {
+				return method;
+			}
+			
+			/* use JDK to find the method
+			 * NOTE: We will not find the method if
+			 * a) one of the parameters is <null>
+			 * b) parsing  from string does not result in the right type
+			 *    (e.g. 1 will be parsed as Long - just pondering why)
+			 */
+			try {
+				return oType.getMethod(name, pTypes);
+			} catch (NoSuchMethodException e) { } // no method found (swallow)
+
+
+			/* Phase 0: 
+			 * Identify Potentially Applicable Methods
+			 */
+			ArrayList<Method> fixArity = new ArrayList<Method>();
+			ArrayList<Method> varArgs = new ArrayList<Method>();
+			identifyCandidates(oType, name, params.length, fixArity, varArgs);
+			
+			List<Method> matched = null;
+			Predicate<Object> juelCoerce = new JuelCoercePredicat(factory);
+
+			/* Phase 1: 
+			 * Identify Matching Arity Methods Applicable by Subtyping
+			 */
+			if ( fixArity.size() != 0 ) {
+				matched = filterMethods(fixArity, pTypes, 
+					MethodFilters.FIXED_ARITY, Predicates.SUB_TYPE
+				);
+				if ( matched.size() != 0 ) {
+					return selectMostSpecific(
+						matched, MethodComparators.FIXED_ARITY, key
+					);
+				}
+	
+				/* Phase 2: 
+				 * Identify Matching Arity Methods Applicable by Method Invocation Conversion
+				 */
+				matched = filterMethods(fixArity, pTypes, 
+					MethodFilters.FIXED_ARITY, Predicates.CONVERSION
+				);
+				if ( matched.size() != 0 ) {
+					return selectMostSpecific(
+						matched, MethodComparators.FIXED_ARITY, key
+					);
+				}
+	
+				/* Phase 2*: 
+				 * Identify Matching Arity Methods Applicable by Method Invocation Conversion 
+				 * (non JVM just for JUEL)
+				 */
+				matched = filterMethods(fixArity, params, 
+					MethodFilters.FIXED_ARITY, juelCoerce
+				);
+				if ( matched.size() != 0 ) {
+					return selectMostSpecific(
+						matched, MethodComparators.FIXED_ARITY, key
+					);
+				}
+			}
+
+			/* Phase 3: 
+			 * Identify Applicable Variable Arity Methods  
+			 */
+			if( varArgs.size() != 0 ) {
+				matched = filterMethods(varArgs, pTypes, 
+					MethodFilters.VARARG_ARITY_TYPE, Predicates.CONVERSION
+				);
+				if ( matched.size() != 0 ) {
+					return selectMostSpecific(
+						matched, MethodComparators.VARARG_ARITIY, key
+					);
+				}
+	
+				/* Phase 3*: 
+				 * Identify Applicable Variable Arity Methods  
+				 * (non JVM just for JUEL)
+				 */
+				matched = filterMethods(varArgs, params, 
+						MethodFilters.VARARG_ARITY_PARAM, juelCoerce
+					);
+				if ( matched.size() != 0 ) {
+					return selectMostSpecific(
+						matched, MethodComparators.VARARG_ARITIY, key
+					);
+				}
+			}
+			
+			return null; // no matching method could be found
+		}
+		
+		/**
+		 * Returns an array containing the types (Class) of the passed object.
+		 * 
+		 * If a given object (params[i]) should be <code>null</code> the
+		 * corresponding type (Class) will be null as well! 
+		 */
+		private static Class<?>[] deriveTypes(Object[] params) {
+			Class<?>[] types = new Class<?>[params.length];
+			for (int i=0; i<params.length; i++) {
+				types[i] = ((params[i] != null) ? params[i].getClass() : null);
+			}
+			return types;
+		}
+
+		/** 
+		 * Identify Potentially Applicable Methods
+		 * 
+		 * a) The method name matches
+		 * b) The method is accessible (given as we only look at public methods)
+		 * c) For fixed arity methods the number of arguments and parameters must be equal
+		 * d) for variable arity methods the number arguments must be >= to the 
+		 *    number of parameters-1
+		 *    
+		 * @param clazz The class for which all public methods are inspected
+		 * @param methodName The name of the method which we are looking for
+		 * @param actualParamCount The number of arguments we what to pass to the method
+		 * @param fixArity List where all matching fixed arity methods are stored 
+		 * @param varArgs List where all matching variable arity methods are stored 
+		 */
+		private static void identifyCandidates(
+			final Class<?> clazz,
+			final String methodName, 
+			final int actualParamCount,
+			List<Method> fixArity, 
+			List<Method> varArgs
+		) {
+	
+			for (Method method : clazz.getMethods()) {
+				if (method.getName().equals(methodName)) {
+					int formalParamCount = method.getParameterTypes().length;
+					if (method.isVarArgs() && actualParamCount >= formalParamCount - 1) {
+						if ( method != null ) {
+							varArgs.add(method);
+						}
+					} 
+					else if (actualParamCount == formalParamCount) {
+						if ( method != null ) {
+							fixArity.add(method);
+						}
+					}
+				}
+			}
+		}
+
+		/**
+		 *  Filters the array of methods passed using the given Filterr
+		 *  
+		 * @param methods List of method to be filtered
+		 * @param params Actual parameters used (used as parameters to the filter)
+		 * @param filter The filter to  be  applied
+		 * @param predicat Predicate used by the filter
+		 * @return Methods which passed the filter
+		 */
+		private static <T> List<Method> filterMethods(
+			List<Method> methods, T[] params, 
+			MethodFilter filter, Predicate<T> predicat
+		) {
+			List<Method> result = new ArrayList<Method>();
+			for (Method method : methods) {
+				if (filter.match(method, params, predicat)) {
+					result.add(method);
+				}
+			}
+			return result;
+		}
+		
+		/**
+		 * Select the most specific method from the given list.
+		 * 
+		 * How the most specific method is defined is specified in the JVM 
+		 * specification chapter '15.12.2.5 Choosing the Most Specific Method'.
+		 * Informally one can say a method 1 is more specific then a method 2 if 
+		 * any call (combination of parameters) that can be handled by method 1 
+		 * also can handled by method 2. Thus method 1 can be removed from the 
+		 * source and the code still compiles. But if method 2 is removed then the
+		 * code would not compile anymore.
+		 *  
+		 * @param methods List of method from which the most specific is chosen
+		 * @param comparator Comparator used to compare tow methods based on how 
+		 * specific they are
+		 * @param key Key under which a method is added to the cache in case a
+		 * most specific method was found. 
+		 * @return The most specific method if there is one.
+		 */
+		private static Method selectMostSpecific(
+			List<Method> methods, Comparator<Method> comparator,
+			List<Object> key
+		) {
+			Method method = null;
+			switch (methods.size()) {
+			case 0:
+				break;
+			case 1:
+				method = methods.get(0);
+				break;
+			case 2:
+				int res = comparator.compare(methods.get(0), methods.get(1));
+				if ( res < 0 ) {
+					method = methods.get(0);
+				}
+				else if ( res > 0 ) {
+					method = methods.get(1);
+				}
+				break;
+			default:
+				Collections.sort(methods, comparator);
+				if (comparator.compare(methods.get(0), methods.get(1)) != 0) {
+					method = methods.get(0);
+				}
+			}
+			if ( method != null ) {
+				methodCache.put(key, method);
+			}
+			return method;
+		}
+		
+		public static class MethodFilters {
+			public static final MethodFilter FIXED_ARITY = new FixedArity();
+			public static final MethodFilter VARARG_ARITY_TYPE = new VarArgArityType();
+			public static final MethodFilter VARARG_ARITY_PARAM = new VarArgArityParam();
+			
+			/**
+			 * Compares a list of parameters against a fixed vaity method. This is done
+			 * by simple testing the actual parameter <code>i</code> against the 
+			 * formal parameter <code>i</code>.
+			 */
+			private static class FixedArity implements MethodFilter {
+				@Override
+				public <T> boolean match(Method method, T[] params, Predicate<T> predicat) {
+					Class<?>[] formalTypes = method.getParameterTypes();
+					for (int i = 0; i < formalTypes.length; i++) {
+						if(!predicat.match(formalTypes[i], params[i])) {
+							return false;
+						}
+					}
+					return true;
+				}
+			}
+
+			/**
+			 * Compares a list of parameters against a variable vaity method. This is done
+			 * by simple testing the actual parameter <code>i</code> against the 
+			 * formal parameter <code>i</code> up the the <code>n-1</code>. The last
+			 * formal parameter must then match all the remaining actual parmameters.
+			 */
+			private abstract static class VarArgArity implements MethodFilter{
+				
+				protected abstract boolean isArray(Object o);
+				
+				@Override
+				public <T> boolean match(Method method, T[] params, Predicate<T> predicat) {
+					Class<?>[] types = method.getParameterTypes();
+					int varArgIdx = types.length-1;
+					// test all but the vararg parameters
+					for (int i = 0; i < varArgIdx; i++) {
+						if(!predicat.match(types[i], params[i])) {
+							return false;
+						}
+					}
+					// if the param does not specify any vararg
+					if (params.length == varArgIdx) {
+						return true;
+					}
+					// test the varArg parameter
+					if (!isArray(params[varArgIdx]) ) {
+						Class<?> argVarType = types[varArgIdx].getComponentType();
+						for (int i = varArgIdx; i < params.length; i++) {
+							if (!predicat.match(argVarType, params[i])) {
+								return false;
+							}
+						}	
+					}
+					else if ( !predicat.match(types[varArgIdx], params[varArgIdx]) ) {
+						return false;
+					}
+					return true;
+				}
+			}
+		}
+		private static class VarArgArityType extends MethodFilters.VarArgArity {
+
+			@Override
+			protected boolean isArray(Object o) {
+				return ((o!=null)?((Class<?>)o).isArray():false);
+			}
+		}
+		private static class VarArgArityParam extends MethodFilters.VarArgArity {
+
+			@Override
+			protected boolean isArray(Object o) {
+				return ((o!=null)?o.getClass().isArray():false);
+			}
+		}
+
+		
+		public static class Predicates {
+			public static final Predicate<Class<?>> SUB_TYPE = new SubType();
+			public static final Predicate<Class<?>> CONVERSION = new Conversion();
+			
+			/**
+			 * Tests whether the a class (actual parameter) is a sub-type of the formal
+			 * parameter. See JVM specification '4.10 Subtyping' for details.
+			 */
+			private static class SubType implements Predicate<Class<?>> {
+				static final private Set<List<Class<?>>> pIsSuperType = new HashSet<List<Class<?>>>();
+				static final private List<Class<?>> tuple(Class<?> c1, Class<?> c2) {
+					List<Class<?>> t = new ArrayList<Class<?>>();
+					t.add(c1); t.add(c2);
+					return t;
+				}
+				static {
+					final Map<Class<?>, Class<?>> pSuperTypes = new HashMap<Class<?>, Class<?>>();
+					// sub-type definition for primitive types as defined by the JVM spec
+					pSuperTypes.put(Byte.TYPE, Byte.TYPE);
+					pSuperTypes.put(Short.TYPE, Byte.TYPE);
+					pSuperTypes.put(Integer.TYPE, Short.TYPE);
+					pSuperTypes.put(Long.TYPE, Integer.TYPE);
+					pSuperTypes.put(Float.TYPE, Long.TYPE);
+					pSuperTypes.put(Double.TYPE, Float.TYPE);
+					// build transitive closure. at runtime the test will the be a simple map-lookup
+					for (Class<?> superClass : pSuperTypes.keySet()) {
+						Class<?> subClass = pSuperTypes.get(superClass);
+						
+						Class<?> oldSubClass = null;
+						do {
+							oldSubClass = subClass;
+							pIsSuperType.add(tuple(superClass, subClass));
+							subClass = pSuperTypes.get(subClass);
+							
+						} while ( oldSubClass != subClass );
+					}
+				}
+				
+				public boolean match(Class<?> formalType, Class<?> actualType) {
+					// null matches anything
+					if ( actualType == null ) {
+						return true;
+					}
+					// formal parameter is a super type (non primitive) 
+					if (formalType.isAssignableFrom(actualType)) {
+						return true; 
+					}
+					// formal parameter is a super type (primitive) 
+					if ( pIsSuperType.contains(tuple(formalType, actualType))) {
+						return true; 
+					}
+					return false;
+				}
+			}
+			
+			/**
+			 * Tests whether the a type (actual parameter) can be converted to another
+			 * type (formal parameter) by applying either
+			 * <li>auto boxing and an optional widening reference conversion</li>
+			 * <li>un-boxing and an optional widening primitive conversion</li>    
+			 */
+			private static class Conversion extends SubType {
+				
+				public boolean match(Class<?> formalType, Class<?> actualType) {
+					// do optional boxing or un-boxing
+					
+					// null can be anything
+					if ( actualType == null ) { 
+						return true;
+					}
+					if ( ! actualType.isPrimitive() && formalType.isPrimitive() ) {
+						actualType = autoUnboxingMap.get(actualType);
+						if ( actualType == null ) { // unboxing failed
+							return false;
+						}
+					}
+					else if ( actualType.isPrimitive() && ! formalType.isPrimitive() ) {
+						actualType = autoBoxingMap.get(actualType);
+					}
+					return super.match(formalType, actualType);	 
+				}
+			}
+			
+			
+			/**
+			 * Tests whether the a type (actual parameter) can be converted to another
+			 * type (formal parameter) by applying JUELS type coerce implementation. 
+			 * 
+			 * Note: This is not part of the JVM specification and violates type savety 
+			 */
+			static class JuelCoercePredicat implements Predicate<Object> {
+				private ExpressionFactory factory;
+				JuelCoercePredicat(ExpressionFactory factory) {
+					this.factory = factory;
+				}
+				public boolean match(Class<?> formalType, Object actualParam) {
+					if (actualParam != null) { // null matches anything
+						try {
+							// if both parameters are arrays lets test the
+							// actual parameters elements against the formal
+							// parameters component type. 
+							if (actualParam != null &&
+								formalType.isArray() && 
+								actualParam.getClass().isArray() 
+							) {
+								formalType = formalType.getComponentType();
+								int len = Array.getLength(actualParam);
+								for(int i=0; i<len; i++) {
+									Object param = Array.get(actualParam, i);
+									if (!match(formalType, param)) {
+										return false;
+									}
+								}
+							}
+							else {
+								factory.coerceToType(actualParam, formalType);
+							}
+						} catch (Exception e) {
+							return false; }
+					}
+					return true;
+				}
+			}
+		}
+		
+		public static class MethodComparators {
+			public static final Comparator<Method> FIXED_ARITY = new FixedArity();
+			public static final Comparator<Method> VARARG_ARITIY = new VarArgArity();
+			
+			static boolean isAssignable(Class<?> c1, Class<?> c2) {
+				return Predicates.CONVERSION.match(c1, c2);
+			}
+
+			/**
+			 * Compares to fixed arity methods based on how specific they are.
+			 * 
+			 * See JVM specification chapter 
+			 * '15.12.2.5 Choosing the Most Specific Method'
+			 */
+			private static class FixedArity implements Comparator<Method> 	{
+				public int compare(Method m1, Method m2) {
+					Class<?>[] p1 = m1.getParameterTypes();
+					Class<?>[] p2 = m2.getParameterTypes();
+					boolean s1 = true;
+					boolean s2 = true;
+					for (int i = 0; i < p1.length; i++) {
+						s1 &= isAssignable(p1[i], p2[i]);
+						s2 &= isAssignable(p2[i], p1[i]);
+					}
+					if (s1 && !s2) {
+						return 1;
+					}
+					if (!s1 && s2) {
+						return -1;
+					}
+					return 0;
+				}
+			}
+			
+			/**
+			 * Compares to variable arity methods based on how specific they are.
+			 * 
+			 * See JVM specification chapter 
+			 * '15.12.2.5 Choosing the Most Specific Method'
+			 */
+			private static class VarArgArity implements Comparator<Method> 	{
+				public int compare(Method m1, Method m2) {
+					
+					Class<?>[] p1 = m1.getParameterTypes();
+					Class<?>[] p2 = m2.getParameterTypes();
+					int l1 = p1.length;
+					int l2 = p2.length;
+					
+					if ( l1 > l2 ) {
+						return - compare(p2, l2, p1, l1);
+					}
+					else {
+						return compare(p1, l1, p2, l2);
+					}
+				}
+				
+				private int compare(Class<?>[] p1, int l1, Class<?>[] p2, int l2 ) { 
+					boolean s1 = true;
+					boolean s2 = true;
+					
+					int len = Math.min(l1, l2)-1;
+					for (int i = 0; i < len; i++) {
+						s1 &= isAssignable(p1[i], p2[i]);
+						s2 &= isAssignable(p2[i], p1[i]);
+					}
+					
+					int last = l2-1;
+					for (int i = len; i < last; i++) {
+						Class<?> c1 = p1[len].getComponentType();
+						Class<?> c2 = p2[i];
+						s1 &= isAssignable(c1, c2);
+						s2 &= isAssignable(c2, c1);
+					}
+					
+					Class<?> c1 = p1[l1 - 1].getComponentType();
+					Class<?> c2 = p2[last].getComponentType();
+					// Autoboxing the array component types
+					if (c1.isPrimitive()) {
+						c1 = autoBoxingMap.get(c1);
+					}
+					if (c2.isPrimitive()) {
+						c2 = autoBoxingMap.get(c2);
+					}
+					// compare the array component type
+					s1 &= isAssignable(c1, c2);
+					s2 &= isAssignable(c2, c1);
+
+					if (s1 && !s2) {
+						return 1;
+					}
+					if (!s1 && s2) {
+						return -1;
+					}
+					return 0;
+				}
+			}
+		}
+	}
+	
 }
