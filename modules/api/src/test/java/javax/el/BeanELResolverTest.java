@@ -23,6 +23,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
+import javax.el.test.TestClass;
+
 import junit.framework.TestCase;
 
 public class BeanELResolverTest extends TestCase {
@@ -161,6 +163,24 @@ public class BeanELResolverTest extends TestCase {
 		} catch (PropertyNotFoundException e) {
 			// fine
 		}
+	}
+
+	public void testGetValue2() {
+		Properties properties = new Properties();
+		properties.setProperty(ExpressionFactory.class.getName(), TestFactory.class.getName());
+		BeanELResolver resolver = new BeanELResolver();
+
+		context.setPropertyResolved(false);
+		assertEquals(42, resolver.getValue(context, new TestClass().getAnonymousTestInterface(), "fourtyTwo"));
+		assertTrue(context.isPropertyResolved());
+
+		context.setPropertyResolved(false);
+		assertEquals(42, resolver.getValue(context, new TestClass().getNestedTestInterface(), "fourtyTwo"));
+		assertTrue(context.isPropertyResolved());
+
+		context.setPropertyResolved(false);
+		assertEquals(42, resolver.getValue(context, new TestClass().getNestedTestInterface2(), "fourtyTwo"));
+		assertTrue(context.isPropertyResolved());
 	}
 
 	public void testIsReadOnly() {
@@ -804,4 +824,10 @@ public class BeanELResolverTest extends TestCase {
 		assertEquals(e, a);
 	}
 	
+	public void testInvoke2() {
+		BeanELResolver resolver = new BeanELResolver();
+		assertEquals(42, resolver.invoke(context, new TestClass().getAnonymousTestInterface(), "getFourtyTwo", null, new Class[]{}));
+		assertEquals(42, resolver.invoke(context, new TestClass().getNestedTestInterface(), "getFourtyTwo", null, new Class[]{}));
+		assertEquals(42, resolver.invoke(context, new TestClass().getNestedTestInterface2(), "getFourtyTwo", null, new Class[]{}));
+	}
 }

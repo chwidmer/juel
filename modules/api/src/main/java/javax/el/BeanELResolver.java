@@ -24,6 +24,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.lang.reflect.Modifier;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -106,41 +107,50 @@ public class BeanELResolver extends ELResolver {
 		}
 	}
 
-	private static Method findAccessibleMethod(Method method) {
-		if (method == null || method.isAccessible()) {
-			return method;
-		}
-		try {
-			method.setAccessible(true);
-		} catch (SecurityException e) {
-			for (Class<?> cls : method.getDeclaringClass().getInterfaces()) {
-				Method mth = null;
-				try {
-					mth = cls.getMethod(method.getName(), method.getParameterTypes());
-					mth = findAccessibleMethod(mth);
-					if (mth != null) {
-						return mth;
-					}
-				} catch (NoSuchMethodException ignore) {
-					// do nothing
-				}
-			}
-			Class<?> cls = method.getDeclaringClass().getSuperclass();
-			if (cls != null) {
-				Method mth = null;
-				try {
-					mth = cls.getMethod(method.getName(), method.getParameterTypes());
-					mth = findAccessibleMethod(mth);
-					if (mth != null) {
-						return mth;
-					}
-				} catch (NoSuchMethodException ignore) {
-					// do nothing
-				}
-			}
+	private static Method findPublicAccessibleMethod(Method method) {
+		if (method == null || !Modifier.isPublic(method.getModifiers())) {
 			return null;
 		}
-		return method;
+		if (method.isAccessible() || Modifier.isPublic(method.getDeclaringClass().getModifiers())) {
+			return method;
+		}
+		for (Class<?> cls : method.getDeclaringClass().getInterfaces()) {
+			Method mth = null;
+			try {
+				mth = findPublicAccessibleMethod(cls.getMethod(method.getName(), method.getParameterTypes()));
+				if (mth != null) {
+					return mth;
+				}
+			} catch (NoSuchMethodException ignore) {
+				// do nothing
+			}
+		}
+		Class<?> cls = method.getDeclaringClass().getSuperclass();
+		if (cls != null) {
+			Method mth = null;
+			try {
+				mth = findPublicAccessibleMethod(cls.getMethod(method.getName(), method.getParameterTypes()));
+				if (mth != null) {
+					return mth;
+				}
+			} catch (NoSuchMethodException ignore) {
+				// do nothing
+			}
+		}
+		return null;
+	}
+
+	private static Method findAccessibleMethod(Method method) {
+		Method result = findPublicAccessibleMethod(method);
+		if (result == null && method != null && Modifier.isPublic(method.getModifiers())) {
+			result = method;
+			try {
+				method.setAccessible(true);
+			} catch (SecurityException e) {
+				result = null; 
+			}
+		}
+		return result;
 	}
 
 	private final boolean readOnly;
@@ -1020,7 +1030,6 @@ public class BeanELResolver extends ELResolver {
 			 * formal parameter <code>i</code>.
 			 */
 			private static class FixedArity implements MethodFilter {
-				@Override
 				public <T> boolean match(Method method, T[] params, Predicate<T> predicat) {
 					Class<?>[] formalTypes = method.getParameterTypes();
 					for (int i = 0; i < formalTypes.length; i++) {
@@ -1042,7 +1051,6 @@ public class BeanELResolver extends ELResolver {
 				
 				protected abstract boolean isArray(Object o);
 				
-				@Override
 				public <T> boolean match(Method method, T[] params, Predicate<T> predicat) {
 					Class<?>[] types = method.getParameterTypes();
 					int varArgIdx = types.length-1;

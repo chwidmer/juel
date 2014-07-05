@@ -16,6 +16,7 @@
 package de.odysseus.el.tree.impl.ast;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 
 import javax.el.ELContext;
 
@@ -46,44 +47,53 @@ public abstract class AstNode implements ExpressionNode {
 
 	/**
 	 * Find accessible method. Searches the inheritance tree of the class declaring
-	 * the method until it finds a method that can be made accessible.
+	 * the method until it finds a method that can be invoked.
 	 * @param method method
 	 * @return accessible method or <code>null</code>
 	 */
-	protected Method findAccessibleMethod(Method method) {
-		if (method == null || method.isAccessible()) {
-			return method;
-		}
-		try {
-			method.setAccessible(true);
-		} catch (SecurityException e) {
-			for (Class<?> cls : method.getDeclaringClass().getInterfaces()) {
-				Method mth = null;
-				try {
-					mth = cls.getMethod(method.getName(), method.getParameterTypes());
-					mth = findAccessibleMethod(mth);
-					if (mth != null) {
-						return mth;
-					}
-				} catch (NoSuchMethodException ignore) {
-					// do nothing
-				}
-			}
-			Class<?> cls = method.getDeclaringClass().getSuperclass();
-			if (cls != null) {
-				Method mth = null;
-				try {
-					mth = cls.getMethod(method.getName(), method.getParameterTypes());
-					mth = findAccessibleMethod(mth);
-					if (mth != null) {
-						return mth;
-					}
-				} catch (NoSuchMethodException ignore) {
-					// do nothing
-				}
-			}
+	private static Method findPublicAccessibleMethod(Method method) {
+		if (method == null || !Modifier.isPublic(method.getModifiers())) {
 			return null;
 		}
-		return method;
+		if (method.isAccessible() || Modifier.isPublic(method.getDeclaringClass().getModifiers())) {
+			return method;
+		}
+		for (Class<?> cls : method.getDeclaringClass().getInterfaces()) {
+			Method mth = null;
+			try {
+				mth = findPublicAccessibleMethod(cls.getMethod(method.getName(), method.getParameterTypes()));
+				if (mth != null) {
+					return mth;
+				}
+			} catch (NoSuchMethodException ignore) {
+				// do nothing
+			}
+		}
+		Class<?> cls = method.getDeclaringClass().getSuperclass();
+		if (cls != null) {
+			Method mth = null;
+			try {
+				mth = findPublicAccessibleMethod(cls.getMethod(method.getName(), method.getParameterTypes()));
+				if (mth != null) {
+					return mth;
+				}
+			} catch (NoSuchMethodException ignore) {
+				// do nothing
+			}
+		}
+		return null;
+	}
+
+	protected Method findAccessibleMethod(Method method) {
+		Method result = findPublicAccessibleMethod(method);
+		if (result == null && method != null && Modifier.isPublic(method.getModifiers())) {
+			result = method;
+			try {
+				method.setAccessible(true);
+			} catch (SecurityException e) {
+				result = null; 
+			}
+		}
+		return result;
 	}
 }
